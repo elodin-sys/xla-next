@@ -3,7 +3,8 @@ on:
   push:
     tags:
       - "v*.*.*"
-
+  workflow_dispatch:
+    
 env:
   NX_XLA_SHA: ${{ github.sha }}
   NX_XLA_RELEASE_NAME: ${{ github.ref_name }}
