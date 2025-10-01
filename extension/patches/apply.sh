@@ -20,4 +20,6 @@ arch="$(uname -m)"
 #
 # See https://github.com/tensorflow/tensorflow/pull/86413 and the
 # referenced threads.
-git apply $dir/cuda_ncrtc_builtins.patch
+
+echo "Applying patches to XLA source code..."
+git apply $dir/*.patch
