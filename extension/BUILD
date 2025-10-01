@@ -1,18 +1,14 @@
-load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm",)
-load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda",)
-load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm",)
-load("//xla/tsl:tsl.bzl", "if_with_tpu_support")
-load("//xla/tsl:tsl.bzl", "tsl_grpc_cc_dependencies",)
-load("//xla/tsl:tsl.bzl", "transitive_hdrs",)
-load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+load("@local_config_cuda//cuda:build_defs.bzl", "if_cuda")
+load("@local_config_rocm//rocm:build_defs.bzl", "if_rocm")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("//xla/stream_executor:build_defs.bzl", "if_cuda_or_rocm")
+load("//xla/tsl:tsl.bzl", "if_with_tpu_support", "transitive_hdrs", "tsl_grpc_cc_dependencies")
+load(":collect_static.bzl", "collect_static")
 
-package(default_visibility=["//visibility:private"])
+package(default_visibility = ["//visibility:private"])
 
-# Shared library which contains the subset of XLA required for EXLA
-cc_binary(
-  name = "libxla_extension.so",
-  deps = [
+DEPS = [
     "//xla:xla_proto_cc_impl",
     "//xla:xla_data_proto_cc_impl",
     "//xla:autotune_results_proto_cc_impl",
@@ -85,57 +81,46 @@ cc_binary(
     "//xla/tsl/framework:allocator",
     "//xla/tsl/framework:allocator_registry_impl",
     "//xla/tsl/util:determinism",
-  ]
-  # GRPC Dependencies (needed for PjRt distributed)
-  + tsl_grpc_cc_dependencies()
-  + if_cuda_or_rocm([
-    "//xla/service:gpu_plugin",
-  ])
-  + if_cuda([
-    "//xla/stream_executor:cuda_platform"
-  ])
-  + if_rocm([
-    "//xla/stream_executor:rocm_platform"
-  ]),
-  copts = ["-fvisibility=default"],
-  linkopts= select({
-    "//xla/tsl:macos": [
-        # We set the install_name, such that the library is looked up
-        # in the RPATH at runtime, otherwise the install_name is an
-        # arbitrary path within bazel workspace
-        "-Wl,-install_name,@rpath/libxla_extension.so",
-        # We set RPATH to the same dir as libxla_extension.so, so that
-        # loading PjRt plugins in the same directory works out of the box
-        "-Wl,-rpath,@loader_path/",
-    ],
-    "//conditions:default": [
-        "-Wl,-soname,libxla_extension.so",
-        "-Wl,-rpath='$$ORIGIN'",
-    ],
-  }),
-  features = ["-use_header_modules"],
-  linkshared = 1,
+]
+
+# Static library which contains the subset of XLA required for EXLA
+cc_library(
+    name = "libxla_extension",
+    features = ["-use_header_modules"],
+    deps = DEPS +
+           # GRPC Dependencies (needed for PjRt distributed)
+           tsl_grpc_cc_dependencies() + if_cuda_or_rocm([
+        "//xla/service:gpu_plugin",
+    ]) + if_cuda([
+        "//xla/stream_executor:cuda_platform",
+    ]) + if_rocm([
+        "//xla/stream_executor:rocm_platform",
+    ]),
+    linkstatic = True,
+)
+
+collect_static(
+    name = "xla_extension_archive",
+    deps = [":libxla_extension"],
 )
 
 # Transitive hdrs gets all headers required by deps, including
 # transitive dependencies, it seems though it generates a lot
 # of unused headers as well
 transitive_hdrs(
-  name = "xla_extension_dep_headers",
-  deps = [
-    ":libxla_extension.so",
-  ]
+    name = "xla_extension_dep_headers",
+    deps = DEPS,
 )
 
 # This is the genrule used by TF install headers to correctly
 # map headers into a directory structure
 genrule(
-  name = "xla_extension_headers",
-  srcs = [
-    ":xla_extension_dep_headers",
-  ],
-  outs = ["include.tar.gz"],
-  cmd = """
+    name = "xla_extension_headers",
+    srcs = [
+        ":xla_extension_dep_headers",
+    ],
+    outs = ["include.tar.gz"],
+    cmd = """
     HEADERS_DIR=$$(mktemp -d)
     for f in $(SRCS); do
       d="$${f%/*}"
@@ -179,64 +164,66 @@ genrule(
     tar czf "$@" -C $${HEADERS_DIR} .
     rm -rf $${HEADERS_DIR}
     """,
-  )
-
-genrule(
-  name = "libtpu_whl",
-  outs = ["libtpu.whl"],
-  cmd = """
-    libtpu_version="0.1.dev20231102"
-    libtpu_storage_path="https://storage.googleapis.com/cloud-tpu-tpuvm-artifacts/wheels/libtpu-nightly/libtpu_nightly-$${libtpu_version}-py3-none-any.whl"
-    wget -O "$@" "$$libtpu_storage_path"
-  """
 )
 
+# Merge all produced .a files into one libxla_extension.a
 genrule(
-  name = "libtpu_so",
-  srcs = [
-    ":libtpu_whl"
-  ],
-  outs = ["libtpu.so"],
-  cmd = """
-    unzip -p "$(SRCS)" libtpu/libtpu.so > "$@"
-  """
+    name = "xla_extension_static",
+    srcs = [":xla_extension_archive"],  # expands to many .a files
+    outs = ["libxla_extension.a"],
+    cmd = r"""
+      set -euo pipefail
+
+      if [[ "$$(uname)" != "Darwin" ]]; then
+	mkdir -p "$(@D)"
+	{
+	  echo "create libxla_extension.a"
+	  for l in $(locations :xla_extension_archive); do
+	    echo "addlib $$PWD/$$l"
+	  done
+	  echo "save"
+	  echo "end"
+	} | ( cd "$(@D)"; ar -M )
+	if [ "$@" != "$(@D)"/libxla_extension.a]; then
+	  cp "$(@D)/libxla_extension.a" "$@"
+	fi
+      else
+        # macOS/Mach-O: libtool -static can take all .a’s directly
+        libtool -static -o "$@" $(locations :xla_extension_archive)
+      fi
+    """,
 )
 
-# This genrule remaps libxla_extension.so to lib/libxla_extension.so
+# Keep your pack step the same: produce lib.tar.gz containing the single archive
 genrule(
-  name = "xla_extension_lib",
-  srcs = [
-    ":libxla_extension.so",
-  ]
-  + if_with_tpu_support([
-    ":libtpu_so"
-  ]),
-  outs = ["lib.tar.gz"],
-  cmd = """
-    LIB_DIR=$$(mktemp -d)
-    mv $(SRCS) $${LIB_DIR}/
-    tar czf "$@" -C $${LIB_DIR} .
-    rm -rf $${LIB_DIR}
-  """
+    name = "xla_extension_lib",
+    srcs = [":xla_extension_static"],
+    outs = ["lib.tar.gz"],
+    cmd = r"""
+      set -euo pipefail
+      d="$(@D)/pack.$$"
+      mkdir -p "$$d/lib"
+      cp $(location :xla_extension_static) "$$d/lib/libxla_extension.a"
+      tar czf "$@" -C "$$d" lib
+    """,
 )
 
 # See https://github.com/bazelbuild/rules_pkg/issues/517#issuecomment-1492917994
 genrule(
-  name = "xla_extension",
-  outs = ["xla_extension.tar.gz"],
-  srcs = [
-    ":xla_extension_lib",
-    ":xla_extension_headers",
-  ],
-  cmd = """
+    name = "xla_extension",
+    srcs = [
+        ":xla_extension_lib",
+        ":xla_extension_headers",
+    ],
+    outs = ["xla_extension.tar.gz"],
+    cmd = """
     mkdir xla_extension
     # Extract the lib tarball
-    mkdir xla_extension/lib
-    tar xzf $(location :xla_extension_lib) -C xla_extension/lib
+    tar xzf $(location :xla_extension_lib) -C xla_extension
     # Extract the headers tarball
     mkdir xla_extension/include
     tar xzf $(location :xla_extension_headers) -C xla_extension/include
     # Create the final package tarball
     tar czf "$@" xla_extension
-  """
+  """,
 )
